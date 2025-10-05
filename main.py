@@ -1,10 +1,16 @@
 import os
+import json
 import requests
+import argparse
+from datetime import datetime
 from dotenv import load_dotenv
-from typing import Any, Optional
+from typing import Any
 from colorama import Fore, Style, init
+from rich.console import Console
+from rich.table import Table
 
-# Initialize color output for Windows
+# Initialize console and color output
+console = Console()
 init(autoreset=True)
 
 # Load environment variables
@@ -14,251 +20,217 @@ load_dotenv()
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 WEATHERAPI_API_KEY = os.getenv("WEATHERAPI_API_KEY")
 VISUALCROSSING_API_KEY = os.getenv("VISUALCROSSING_API_KEY")
-# (You can add more providers and keys here)
 
-# URLs / endpoints for each provider
+# URLs / endpoints
 OWM_URL = "https://api.openweathermap.org/data/2.5/weather"
+OWM_FORECAST_URL = "https://api.openweathermap.org/data/2.5/forecast"
 WEATHERAPI_URL = "https://api.weatherapi.com/v1/current.json"
+WEATHERAPI_FORECAST_URL = "https://api.weatherapi.com/v1/forecast.json"
 VISUALCROSSING_URL = "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline"
 
-# Cache to prevent redundant API calls
+# Cache and logs
+CACHE_FILE = "weather_cache.json"
+LOG_FILE = "weather.log"
 weather_cache: dict[str, dict[str, Any]] = {}
+provider_stats = {"openweather": 0, "weatherapi": 0, "visualcrossing": 0, "open-meteo": 0}
 
 
 class WeatherProviderError(Exception):
-    """Indicates that a provider could not return data (e.g. error or missing key)."""
     pass
 
 
-def fetch_openweather(city: str, units: str) -> dict[str, Any]:
-    """Fetch from OpenWeatherMap."""
+# ----------- Utility Functions -----------
+
+def log_event(message: str) -> None:
+    """Append log messages with timestamp."""
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{datetime.now().isoformat()}] {message}\n")
+
+
+def load_cache() -> None:
+    """Load cached weather results."""
+    global weather_cache
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                weather_cache.update(json.load(f))
+        except json.JSONDecodeError:
+            pass
+
+
+def save_cache() -> None:
+    """Save cache to disk."""
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(weather_cache, f, indent=2)
+
+
+def detect_location() -> str:
+    """Detect approximate user location by IP."""
+    try:
+        resp = requests.get("https://ipapi.co/json/", timeout=5)
+        resp.raise_for_status()
+        city = resp.json().get("city")
+        if city:
+            return city
+    except Exception:
+        return ""
+    return ""
+
+
+# ----------- Weather Providers -----------
+
+def fetch_openweather(city: str, units: str, forecast=False):
     if not OPENWEATHER_API_KEY:
-        raise WeatherProviderError("No OpenWeather API key configured")
-    params = {
-        "q": city,
-        "appid": OPENWEATHER_API_KEY,
-        "units": units,
-    }
-    resp = requests.get(OWM_URL, params=params, timeout=10)
+        raise WeatherProviderError("Missing OpenWeather API key.")
+    params = {"q": city, "appid": OPENWEATHER_API_KEY, "units": units}
+    url = OWM_FORECAST_URL if forecast else OWM_URL
+    resp = requests.get(url, params=params, timeout=10)
     resp.raise_for_status()
     data = resp.json()
-    if data.get("cod") != 200:
+    if data.get("cod") not in (200, "200"):
         raise WeatherProviderError(data.get("message", "OpenWeather API error"))
-    # Normalize to a common schema
-    return {
-        "provider": "openweather",
-        "data": data
-    }
+    provider_stats["openweather"] += 1
+    return {"provider": "openweather", "data": data}
 
 
-def fetch_weatherapi(city: str, units: str) -> dict[str, Any]:
-    """Fetch from WeatherAPI.com."""
+def fetch_weatherapi(city: str, units: str, forecast=False):
     if not WEATHERAPI_API_KEY:
-        raise WeatherProviderError("No WeatherAPI key configured")
-    # WeatherAPI uses separate fields for Celsius vs Fahrenheit
-    # We ignore units param and convert if needed (or pass &aqi=no)
-    params = {
-        "key": WEATHERAPI_API_KEY,
-        "q": city,
-        "aqi": "no",
-    }
-    resp = requests.get(WEATHERAPI_URL, params=params, timeout=10)
+        raise WeatherProviderError("Missing WeatherAPI key.")
+    params = {"key": WEATHERAPI_API_KEY, "q": city, "aqi": "no"}
+    if forecast:
+        params["days"] = 5
+        url = WEATHERAPI_FORECAST_URL
+    else:
+        url = WEATHERAPI_URL
+    resp = requests.get(url, params=params, timeout=10)
     resp.raise_for_status()
     data = resp.json()
-    # Handle errors
     if "error" in data:
-        raise WeatherProviderError(data["error"].get("message", "WeatherAPI error"))
-    return {
-        "provider": "weatherapi",
-        "data": data
-    }
+        raise WeatherProviderError(data["error"]["message"])
+    provider_stats["weatherapi"] += 1
+    return {"provider": "weatherapi", "data": data}
 
 
-def fetch_visualcrossing(city: str, units: str) -> dict[str, Any]:
-    """Fetch from Visual Crossing API."""
+def fetch_visualcrossing(city: str, units: str):
     if not VISUALCROSSING_API_KEY:
-        raise WeatherProviderError("No Visual Crossing key configured")
-    # Visual Crossing uses a “timeline” endpoint; for current we request today
-    # Units: metric or us (imperial)
+        raise WeatherProviderError("Missing Visual Crossing key.")
     unit_group = "metric" if units == "metric" else "us"
     url = f"{VISUALCROSSING_URL}/{city}"
-    params = {
-        "unitGroup": unit_group,
-        "key": VISUALCROSSING_API_KEY,
-        "include": "current",
-    }
+    params = {"unitGroup": unit_group, "key": VISUALCROSSING_API_KEY, "include": "current"}
     resp = requests.get(url, params=params, timeout=10)
     resp.raise_for_status()
     data = resp.json()
-    # Check for errors
     if "errorCode" in data:
-        raise WeatherProviderError(data.get("message", "Visual Crossing error"))
-    return {
-        "provider": "visualcrossing",
-        "data": data
-    }
+        raise WeatherProviderError(data.get("message", "VisualCrossing error"))
+    provider_stats["visualcrossing"] += 1
+    return {"provider": "visualcrossing", "data": data}
 
 
-def fetch_open_meteo(lat: float, lon: float, units: str) -> dict[str, Any]:
-    """Fetch from Open-Meteo (no API key required) as fallback."""
-    # Open-Meteo’s “current weather” endpoint
-    # It returns e.g. “temperature” in Celsius; if units = imperial, convert later
+def fetch_open_meteo(lat: float, lon: float, units: str):
     url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "current_weather": "true",
-    }
+    params = {"latitude": lat, "longitude": lon, "current_weather": "true"}
     resp = requests.get(url, params=params, timeout=10)
     resp.raise_for_status()
     data = resp.json()
-    return {
-        "provider": "open-meteo",
-        "data": data
-    }
+    provider_stats["open-meteo"] += 1
+    return {"provider": "open-meteo", "data": data}
 
 
-def get_weather(city: str, units: str = "metric") -> dict[str, Any]:
-    """Try available providers in order until one returns valid data."""
-    # Use caching
-    cache_key = f"{city.lower()}_{units}"
+# ----------- Core Weather Logic -----------
+
+def get_weather(city: str, units="metric", forecast=False):
+    cache_key = f"{city.lower()}_{units}_{forecast}"
     if cache_key in weather_cache:
         return weather_cache[cache_key]
 
-    # Attempt providers in order of preference
+    fetchers = [fetch_openweather, fetch_weatherapi, fetch_visualcrossing]
     errors = []
-    for fetcher in (fetch_openweather, fetch_weatherapi, fetch_visualcrossing):
+    for fetcher in sorted(fetchers, key=lambda f: -provider_stats.get(f.__name__.split("_")[1], 0)):
         try:
-            result = fetcher(city, units)
+            result = fetcher(city, units, forecast=forecast) if "forecast" in fetcher.__code__.co_varnames else fetcher(city, units)
             weather_cache[cache_key] = result
+            save_cache()
             return result
-        except WeatherProviderError as wpe:
-            errors.append(f"{fetcher.__name__}: {wpe}")
-        except requests.RequestException as re:
-            errors.append(f"{fetcher.__name__}: network error {re}")
+        except Exception as e:
+            log_event(f"{fetcher.__name__} failed: {e}")
+            errors.append(str(e))
 
-    # As fallback, try open-meteo if we can geocode city to lat/lon
-    # Simple geocoding via OpenWeather if key exists
-    if OPENWEATHER_API_KEY:
-        try:
-            # Use OWM geocoding API
-            geo_url = "http://api.openweathermap.org/geo/1.0/direct"
-            geo_params = {
-                "q": city,
-                "limit": 1,
-                "appid": OPENWEATHER_API_KEY,
-            }
-            r = requests.get(geo_url, params=geo_params, timeout=5)
-            r.raise_for_status()
-            glist = r.json()
-            if glist:
-                lat = glist[0]["lat"]
-                lon = glist[0]["lon"]
-                om = fetch_open_meteo(lat, lon, units)
-                weather_cache[cache_key] = om
-                return om
-        except Exception as ge:
-            errors.append(f"open_meteo fallback geocode: {ge}")
-
-    # If all fail:
-    err_msg = "All weather providers failed:\n" + "\n".join(errors)
-    raise RuntimeError(err_msg)
+    raise RuntimeError("All weather providers failed:\n" + "\n".join(errors))
 
 
-def display_weather(resp_struct: dict[str, Any], units: str) -> None:
-    """Display weather info in a unified way, adapting per provider."""
-    provider = resp_struct.get("provider", "unknown")
-    d = resp_struct.get("data", {})
+# ----------- Display -----------
 
+def display_weather(resp: dict[str, Any], units: str, forecast=False):
+    provider = resp["provider"]
+    data = resp["data"]
     temp_unit = "°C" if units == "metric" else "°F"
-    print(f"\n{Fore.CYAN}---- Weather Report ({provider}) ----{Style.RESET_ALL}")
+    console.print(f"\n[bold cyan]Weather Report ({provider})[/bold cyan]")
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Metric", justify="right")
+    table.add_column("Value", justify="left")
 
     if provider == "openweather":
-        city = d.get("name", "?")
-        country = d.get("sys", {}).get("country", "?")
-        main = d.get("main", {})
-        wind = d.get("wind", {})
-        weather = d.get("weather", [{}])[0]
-        print(f"{Fore.YELLOW}City:{Style.RESET_ALL} {city}, {country}")
-        print(f"{Fore.YELLOW}Temperature:{Style.RESET_ALL} {main.get('temp', '?')} {temp_unit}")
-        print(f"{Fore.YELLOW}Feels Like:{Style.RESET_ALL} {main.get('feels_like', '?')} {temp_unit}")
-        print(f"{Fore.YELLOW}Humidity:{Style.RESET_ALL} {main.get('humidity', '?')}%")
-        print(f"{Fore.YELLOW}Weather:{Style.RESET_ALL} {weather.get('description', 'N/A').title()}")
-        print(f"{Fore.YELLOW}Wind Speed:{Style.RESET_ALL} {wind.get('speed', '?')} m/s")
-
+        main = data.get("main", {})
+        weather = data.get("weather", [{}])[0]
+        table.add_row("City", data.get("name", "?"))
+        table.add_row("Temperature", f"{main.get('temp', '?')} {temp_unit}")
+        table.add_row("Humidity", f"{main.get('humidity', '?')}%")
+        table.add_row("Weather", weather.get("description", "N/A").title())
     elif provider == "weatherapi":
-        loc = d.get("location", {})
-        curr = d.get("current", {})
-        city = loc.get("name", "?")
-        country = loc.get("country", "?")
-        # Temperature fields: temp_c, temp_f
-        temp = curr.get("temp_c") if units == "metric" else curr.get("temp_f")
-        feels = curr.get("feelslike_c") if units == "metric" else curr.get("feelslike_f")
-        print(f"{Fore.YELLOW}City:{Style.RESET_ALL} {city}, {country}")
-        print(f"{Fore.YELLOW}Temperature:{Style.RESET_ALL} {temp} {temp_unit}")
-        print(f"{Fore.YELLOW}Feels Like:{Style.RESET_ALL} {feels} {temp_unit}")
-        print(f"{Fore.YELLOW}Humidity:{Style.RESET_ALL} {curr.get('humidity', '?')}%")
-        print(f"{Fore.YELLOW}Weather:{Style.RESET_ALL} {curr.get('condition', {}).get('text', 'N/A')}")
-        print(f"{Fore.YELLOW}Wind Speed:{Style.RESET_ALL} {(curr.get('wind_kph', '?') / 3.6) if units == 'metric' else curr.get('wind_mph', '?')} m/s")
-
+        loc = data["location"]
+        curr = data["current"]
+        table.add_row("City", f"{loc['name']}, {loc['country']}")
+        table.add_row("Temperature", f"{curr['temp_c'] if units == 'metric' else curr['temp_f']} {temp_unit}")
+        table.add_row("Humidity", f"{curr['humidity']}%")
+        table.add_row("Condition", curr["condition"]["text"])
     elif provider == "visualcrossing":
-        # Visual Crossing “currentConditions” is under data["currentConditions"]
-        city = d.get("address", "?")
-        cc = d.get("currentConditions", {})
-        temp = cc.get("temp")
-        feels = cc.get("feelslike")
-        humidity = cc.get("humidity")
-        wind = cc.get("windspeed")
-        conditions = cc.get("conditions")
-        print(f"{Fore.YELLOW}City:{Style.RESET_ALL} {city}")
-        print(f"{Fore.YELLOW}Temperature:{Style.RESET_ALL} {temp} {temp_unit}")
-        print(f"{Fore.YELLOW}Feels Like:{Style.RESET_ALL} {feels} {temp_unit}")
-        print(f"{Fore.YELLOW}Humidity:{Style.RESET_ALL} {humidity}%")
-        print(f"{Fore.YELLOW}Weather:{Style.RESET_ALL} {conditions}")
-        print(f"{Fore.YELLOW}Wind Speed:{Style.RESET_ALL} {wind} m/s")
-
+        cc = data["currentConditions"]
+        table.add_row("City", data.get("address", "?"))
+        table.add_row("Temperature", f"{cc.get('temp', '?')} {temp_unit}")
+        table.add_row("Weather", cc.get("conditions", "N/A"))
     elif provider == "open-meteo":
-        # Open-Meteo returns "current_weather"
-        cw = d.get("current_weather", {})
-        temp_c = cw.get("temperature")
-        # It gives speed in m/s
-        wind = cw.get("windspeed")
-        # No feels or humidity by default
-        print(f"{Fore.YELLOW}Temperature:{Style.RESET_ALL} {temp_c} °C")
-        print(f"{Fore.YELLOW}Wind Speed:{Style.RESET_ALL} {wind} m/s")
+        cw = data["current_weather"]
+        table.add_row("Temperature", f"{cw['temperature']} °C")
+        table.add_row("Windspeed", f"{cw['windspeed']} m/s")
 
-    else:
-        print("Unhandled provider. Raw data:")
-        print(d)
+    console.print(table)
 
-    print(f"{Fore.CYAN}------------------------------{Style.RESET_ALL}\n")
+    # Forecast summary
+    if forecast and provider in ("openweather", "weatherapi"):
+        console.print("\n[bold yellow]5-Day Forecast:[/bold yellow]")
+        if provider == "openweather":
+            for entry in data["list"][:5]:
+                dt = datetime.fromtimestamp(entry["dt"]).strftime("%a %H:%M")
+                desc = entry["weather"][0]["description"]
+                temp = entry["main"]["temp"]
+                console.print(f"• {dt}: {temp} {temp_unit}, {desc}")
+        elif provider == "weatherapi":
+            for d in data["forecast"]["forecastday"]:
+                date = d["date"]
+                condition = d["day"]["condition"]["text"]
+                avg = d["day"]["avgtemp_c"] if units == "metric" else d["day"]["avgtemp_f"]
+                console.print(f"• {date}: {avg}{temp_unit}, {condition}")
 
 
-def main() -> None:
-    """Run the Weather CLI application."""
-    print(f"{Fore.MAGENTA}🌦️  Welcome to Weather CLI App 🌦️{Style.RESET_ALL}")
+# ----------- CLI -----------
+
+def main():
+    parser = argparse.ArgumentParser(description="🌦️  Weather CLI App")
+    parser.add_argument("city", nargs="?", help="City name (optional)")
+    parser.add_argument("--units", choices=["c", "f"], default="c", help="Temperature unit")
+    parser.add_argument("--forecast", action="store_true", help="Show 5-day forecast")
+    args = parser.parse_args()
+
+    load_cache()
+    city = args.city or detect_location() or input("Enter city name: ").strip()
+    units = "metric" if args.units == "c" else "imperial"
+
     try:
-        while True:
-            city = input("\nEnter city name (or type 'exit' to quit): ").strip()
-            if city.lower() == "exit":
-                print(f"{Fore.GREEN}Goodbye! 👋{Style.RESET_ALL}")
-                break
-
-            if not city:
-                print(f"{Fore.RED}⚠️  City name cannot be empty. Please try again.{Style.RESET_ALL}")
-                continue
-
-            units_choice = input("Choose units - Celsius (c) or Fahrenheit (f): ").lower().strip()
-            units = "metric" if units_choice == "c" else "imperial"
-
-            try:
-                weather_resp = get_weather(city, units)
-                display_weather(weather_resp, units)
-            except Exception as e:
-                print(f"{Fore.RED}⚠️  {e}{Style.RESET_ALL}")
-
-    except KeyboardInterrupt:
-        print(f"\n{Fore.GREEN}Goodbye! 👋{Style.RESET_ALL}")
+        resp = get_weather(city, units, forecast=args.forecast)
+        display_weather(resp, units, forecast=args.forecast)
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
 
 
 if __name__ == "__main__":
